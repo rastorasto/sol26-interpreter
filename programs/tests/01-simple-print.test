@@ -1,0 +1,13 @@
++++ BASIC
+*** Test jednoducheho programu
+!C! 0
+!I! 0
+
+class Main : Object {
+  run
+    [ |
+      x := 42.
+      y := x asString.
+      _ := y print.
+    ]
+}

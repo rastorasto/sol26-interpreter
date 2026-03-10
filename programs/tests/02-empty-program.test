@@ -1,0 +1,8 @@
++++ BASIC
+*** Test prazdneho programu
+!C! 0
+!I! 0
+
+class Main : Object {
+    run [|]
+}
