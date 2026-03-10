@@ -14,11 +14,14 @@
  *                  module based on its Python counterpart.
  */
 
-import { existsSync, lstatSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, lstatSync, writeFileSync, readdirSync, readFileSync, unlink } from "node:fs";
+import { basename, dirname, resolve, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { TestReport } from "./models.js";
+import { TestCaseDefinition, TestCaseType, TestReport } from "./models.js";
+
+import { spawnSync } from "node:child_process";
 
 import { pino } from "pino";
 
@@ -218,10 +221,266 @@ function main(): void {
   }
 
   // TODO: Your code for discovering and executing the test cases goes here.
+  
+  for (const key in args) {
+    logger.debug("Argument %s: %o", key, args[key as keyof CliArguments]);
+  }
+
+  const tests = discoverTests(args.tests_dir, args.recursive);
+
+  const discovered_test_cases: TestCaseDefinition[] = [];
+  for (const test of tests) {
+    logger.info("Discovered test: %s", test);
+    let parsed_test = parseTest(test);
+    if (parsed_test) {
+      discovered_test_cases.push(parsed_test);
+    } else {
+      logger.warn("Failed to parse test case file: %s", test);
+    }
+  }
+
+  for(const test_case of discovered_test_cases) {
+    let result = runTest(test_case);
+    logger.info("Test case %s resulted in: %o", test_case.name, result);
+  }
+
 
   // Example of how to write the final report:
-  const report = new TestReport({ discovered_test_cases: [], unexecuted: {}, results: {} });
+  const report = new TestReport({ discovered_test_cases, unexecuted: {}, results: {} });
   writeResult(report, args.output);
+
+  logger.debug("End of program");
+}
+
+function discoverTests(directory: string, recursive: boolean) : string[] {
+  const tests: string[] = [];
+  readdirSync(directory, { withFileTypes: true }).forEach((entry) => {
+    if (entry.isDirectory() && recursive) {
+      tests.push(...discoverTests(resolve(directory, entry.name), recursive));
+    }
+    else if (entry.isFile() && entry.name.endsWith(".test")) {
+      tests.push(resolve(directory, entry.name));
+    }
+  });
+  return tests; 
+}
+
+function parseTest(testPath: string): TestCaseDefinition{
+    let test_type: TestCaseType = TestCaseType.COMBINED;
+    let description: string | null = null;
+    let category: string | null = null;
+    let points: number = 0;
+    let expected_parser_exit_codes: number[] | null = [];
+    let expected_interpreter_exit_codes: number[] | null = [];
+
+    readFileSync(testPath, "utf8").split("\n").forEach((line) => {
+    logger.debug("Test line: %s", line);
+
+    if(line.startsWith("***")) {
+      description = line.substring(3).trim();
+    }
+    else if(line.startsWith("+++")) {
+      category = line.substring(3).trim();
+    }
+    else if(line.startsWith("!C!")) {
+      expected_parser_exit_codes.push(parseInt(line.substring(3).trim()));
+    }
+    else if(line.startsWith("!I!")) {
+      expected_interpreter_exit_codes.push(parseInt(line.substring(3).trim()));
+    }
+    else if(line.startsWith(">>>")) {
+      points = parseInt(line.substring(3).trim());
+    }
+  });
+
+    if(expected_interpreter_exit_codes.length > 0 && expected_parser_exit_codes.length > 0) {
+      test_type = TestCaseType.COMBINED;
+    } else if (expected_interpreter_exit_codes.length > 0) {
+      test_type = TestCaseType.EXECUTE_ONLY;
+    } else if (expected_parser_exit_codes.length > 0) {
+      test_type = TestCaseType.PARSE_ONLY;
+    } else {
+      // TODO maybe have default one or exit here
+      // okay so i changed it so that COMBINED is default, but i will leave this else here
+      logger.warn("No test case specified for test file %s", testPath);
+    }
+
+    let name = basename(testPath, ".test");
+    let stdin_file: string | null = resolve(dirname(testPath), name + ".in");
+    let expected_stdout_file: string | null = resolve(dirname(testPath), name + ".out");
+    
+    if (!existsSync(stdin_file)) {
+      stdin_file = null;
+    }
+
+    if (!existsSync(expected_stdout_file)) {
+      expected_stdout_file = null;
+    }
+
+
+    return new TestCaseDefinition({
+      name,
+      test_source_path: testPath,
+      stdin_file,
+      expected_stdout_file,
+      test_type,
+      description,
+      category: category ?? "uncategorized",
+      points,
+      // todo write this better :3
+      expected_parser_exit_codes: expected_parser_exit_codes?.length ? expected_parser_exit_codes : null,
+      expected_interpreter_exit_codes: expected_interpreter_exit_codes?.length ? expected_interpreter_exit_codes : null,
+    
+  });
+}
+
+function runTest(test_case: TestCaseDefinition) : boolean {
+  const lines = readFileSync(test_case.test_source_path, "utf8").split("\n");
+  const empty_line = lines.findIndex(line => line.trim() === "");
+
+  const source_code = lines.slice(empty_line + 1).join("\n");
+
+  logger.debug("Running test case %s with source code:\n%s", test_case.name, source_code);
+
+  if(source_code.startsWith('<?xml version="1.0" encoding="UTF-8"?>')) {
+    logger.info("Source code is XML");
+  } else {
+    logger.info("Source code is SOL26");
+    let converted_code = convertToXml(source_code);
+    
+    logger.debug("Converted code:\n%s", converted_code);
+
+    let result = runInterpreter(converted_code, test_case.stdin_file);
+    logger.debug("Interpreter stdout:\n%s", result.stdout);
+    logger.debug("Interpreter exit code: %s", result.exit_code);
+    
+    const exit_code_comparison = compareExitCode(result.exit_code, test_case.expected_interpreter_exit_codes);
+    if (!exit_code_comparison) {
+      logger.info("Test case %s failed: exit code", test_case.name);
+      return false;
+    }
+
+    if (test_case.expected_stdout_file && result.exit_code === 0) {
+      const stdout_comparison = compareStdout(result.stdout, test_case.expected_stdout_file);
+      if (!stdout_comparison) {
+        logger.info("Test case %s failed: stdout", test_case.name);
+        return false;
+      }
+    }
+
+    logger.info("Test case %s passed", test_case.name);
+    return true;
+  }
+
+
+  return false;
+}
+
+function convertToXml(sol26_code: string): string {
+  // logger.debug("Converting SOL26 code to XML:\n%s", sol26_code);
+
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  // TODO make this better not with hardcoded paths :3
+  const sol2xmlPath = resolve(currentDir, "../../../sol2xml/sol_to_xml.py");
+  const pythonPath = resolve(currentDir, "../../../.venv/bin/python3");
+  const convert = spawnSync(pythonPath, [sol2xmlPath], { input: sol26_code, encoding: "utf8" });
+  
+  if (convert.error) {
+    logger.error("Error executing sol2xml.py");
+    return "";
+  }
+
+  if (convert.status !== 0) {
+    logger.error("sol2 exited with error status %s", convert.stderr);
+    return "";
+  }
+
+  return convert.stdout;
+}
+
+interface InterpreterResult {
+  stdout: string;
+  exit_code: number | null;
+}
+
+function runInterpreter(xml_code: string, stdin_file: string | null): InterpreterResult {
+  logger.debug("Running interpreter");
+
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const interpreterPath = resolve(currentDir, "../../../python/int/src/solint.py");
+  const pythonPath = resolve(currentDir, "../../../.venv/bin/python3");
+  
+  const tempFile = join(currentDir, "temp_code.xml");
+  writeFileSync(tempFile, xml_code, "utf8");
+
+  let args: string[];
+  if(stdin_file) {
+    logger.debug("Using stdin file: %s", stdin_file);
+    args = [interpreterPath, "-s", tempFile, "-i", stdin_file];
+  } else {
+    logger.debug("No stdin file provided, using empty input");
+    args = [interpreterPath, "-s", tempFile];
+  }
+
+
+  const result = spawnSync(pythonPath, args, { input: xml_code, encoding: "utf8" });
+
+  unlink(tempFile, (err) => {
+    if (err) {
+      logger.error("Failed to delete temporary file: %s", tempFile);
+    }
+  });
+
+  logger.debug("Interpreter execution result: %o", result);
+  logger.debug("Interpreter status: %s", result.status);
+  logger.debug("Interpreter stdout:\n%s", result.stdout);
+  logger.debug("Interpreter stderr:\n%s", result.stderr);
+
+  return {stdout: result.stdout, exit_code: result.status};
+}
+
+function compareStdout(actual: string, expectedFile: string | null): boolean {
+  if (expectedFile === null) {
+    logger.warn("No expected stdout file provided for comparison.");
+    return false;
+  }
+  
+  const tempoutput = join(dirname(fileURLToPath(import.meta.url)), "temp_output.txt");
+  writeFileSync(tempoutput, actual, "utf8");
+
+  const diffResult = spawnSync("diff", [ tempoutput, expectedFile], { encoding: "utf8" });
+
+  unlink(tempoutput, (err) => {
+    if (err) {
+      logger.error("Failed to delete temporary file: %s", tempoutput);
+    }
+  });
+
+  if (diffResult.error) {
+    logger.error("Error executing diff command");
+    return false;
+  }
+
+  if (diffResult.status === 0) {
+    return true;
+  } else {
+    logger.info("Diff: %s", diffResult.stdout);
+    return false;
+  }
+}
+
+function compareExitCode(actual: number | null, expected: number[] | null): boolean {
+  if (expected === null) {
+    logger.warn("No expected exit codes provided for comparison.");
+    return false;
+  }
+
+  if (actual === null) {
+    logger.warn("Actual exit code is null, cannot compare.");
+    return false;
+  }
+
+  return expected.includes(actual);
 }
 
 main();

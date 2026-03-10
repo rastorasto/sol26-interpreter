@@ -23,3 +23,11 @@ class InterpreterError(Exception):
     def __init__(self, error_code: ErrorCode, message: str | None = None) -> None:
         super().__init__(message)
         self.error_code = error_code
+
+class ZeroDivisionError(InterpreterError):
+    """
+    Exception raised when a division by zero is attempted during interpretation.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(error_code=ErrorCode.INT_RUNTIME, message=message)
