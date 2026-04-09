@@ -19,7 +19,7 @@ import { basename, dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { TestCaseDefinition, TestCaseType, TestReport } from "./models.js";
+import { TestCaseDefinition, TestCaseReport, TestCaseType, TestReport, TestResult, CategoryReport} from "./models.js";
 
 import { spawnSync } from "node:child_process";
 
@@ -239,24 +239,44 @@ function main(): void {
     }
   }
 
-  for(const test_case of discovered_test_cases) {
-    let result = runTest(test_case);
-    logger.info("Test case %s resulted in: %o", test_case.name, result);
+  const test_categories: Record<string, { total: number; passed: number; test_results: Record<string, TestCaseReport> }> = {};
+
+
+  for (const test_case of discovered_test_cases) {
+    const report = runTest(test_case);
+    logger.info("Test case %s resulted in: %o", test_case.name, report);
+
+    const category = test_case.category;
+
+    if(!test_categories[category]) {
+      test_categories[category] = { total: 0, passed: 0, test_results: {} };
+    }
+
+    test_categories[category].test_results[test_case.name] = report;
+    test_categories[category].total += test_case.points;
+    if (report.result === TestResult.PASSED) {
+      test_categories[category].passed += test_case.points;
+    }
   }
 
+  const results: Record<string, CategoryReport> = {};
+  for (const category in test_categories) {
+    const entry = test_categories[category]!; // i hope this wont bite me in the ... :3
+    results[category] = new CategoryReport(entry.total, entry.passed, entry.test_results);
+  }
 
-  // Example of how to write the final report:
-  const report = new TestReport({ discovered_test_cases, unexecuted: {}, results: {} });
+  // // todo unexecuted
+  const report = new TestReport({ discovered_test_cases, unexecuted: {}, results });
   writeResult(report, args.output);
 
   logger.debug("End of program");
 }
 
 function discoverTests(directory: string, recursive: boolean) : string[] {
-  const tests: string[] = [];
+  let tests: string[] = [];
   readdirSync(directory, { withFileTypes: true }).forEach((entry) => {
     if (entry.isDirectory() && recursive) {
-      tests.push(...discoverTests(resolve(directory, entry.name), recursive));
+      tests = tests.concat(discoverTests(resolve(directory, entry.name), recursive));
     }
     else if (entry.isFile() && entry.name.endsWith(".test")) {
       tests.push(resolve(directory, entry.name));
@@ -334,7 +354,7 @@ function parseTest(testPath: string): TestCaseDefinition{
   });
 }
 
-function runTest(test_case: TestCaseDefinition) : boolean {
+function runTest(test_case: TestCaseDefinition) : TestCaseReport {
   const lines = readFileSync(test_case.test_source_path, "utf8").split("\n");
   const empty_line = lines.findIndex(line => line.trim() === "");
 
@@ -353,27 +373,65 @@ function runTest(test_case: TestCaseDefinition) : boolean {
     let result = runInterpreter(converted_code, test_case.stdin_file);
     logger.debug("Interpreter stdout:\n%s", result.stdout);
     logger.debug("Interpreter exit code: %s", result.exit_code);
+    logger.debug("Interpreter stderr:\n%s", result.stderr);
     
     const exit_code_comparison = compareExitCode(result.exit_code, test_case.expected_interpreter_exit_codes);
     if (!exit_code_comparison) {
       logger.info("Test case %s failed: exit code", test_case.name);
-      return false;
+      return new TestCaseReport(
+      TestResult.UNEXPECTED_INTERPRETER_EXIT_CODE,
+      null,
+      result.exit_code,
+      null,
+      null,
+      result.stdout,
+      result.stderr,
+      null
+    );
     }
 
     if (test_case.expected_stdout_file && result.exit_code === 0) {
       const stdout_comparison = compareStdout(result.stdout, test_case.expected_stdout_file);
       if (!stdout_comparison) {
         logger.info("Test case %s failed: stdout", test_case.name);
-        return false;
+        return new TestCaseReport(
+          TestResult.INTERPRETER_RESULT_DIFFERS,
+          null,
+          result.exit_code,
+          null,
+          null,
+          result.stdout,
+          result.stderr,
+          null
+        );
       }
     }
 
     logger.info("Test case %s passed", test_case.name);
-    return true;
+    return new TestCaseReport(
+      TestResult.PASSED,
+      null,
+      result.exit_code,
+      null,
+      null,
+      result.stdout,
+      result.stderr,
+      null
+    );
   }
 
-
-  return false;
+  // shouldnt get here?
+  logger.error("shouldnt get here");
+  return new TestCaseReport(
+    TestResult.UNEXPECTED_PARSER_EXIT_CODE,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   );
 }
 
 function convertToXml(sol26_code: string): string {
@@ -400,6 +458,7 @@ function convertToXml(sol26_code: string): string {
 
 interface InterpreterResult {
   stdout: string;
+  stderr: string;
   exit_code: number | null;
 }
 
@@ -418,7 +477,7 @@ function runInterpreter(xml_code: string, stdin_file: string | null): Interprete
     logger.debug("Using stdin file: %s", stdin_file);
     args = [interpreterPath, "-s", tempFile, "-i", stdin_file];
   } else {
-    logger.debug("No stdin file provided, using empty input");
+    logger.debug("No stdin file provided, no input used");
     args = [interpreterPath, "-s", tempFile];
   }
 
@@ -431,12 +490,12 @@ function runInterpreter(xml_code: string, stdin_file: string | null): Interprete
     }
   });
 
-  logger.debug("Interpreter execution result: %o", result);
-  logger.debug("Interpreter status: %s", result.status);
-  logger.debug("Interpreter stdout:\n%s", result.stdout);
-  logger.debug("Interpreter stderr:\n%s", result.stderr);
+  // logger.debug("Interpreter execution result: %o", result);
+  // logger.debug("Interpreter status: %s", result.status);
+  // logger.debug("Interpreter stdout:\n%s", result.stdout);
+  // logger.debug("Interpreter stderr:\n%s", result.stderr);
 
-  return {stdout: result.stdout, exit_code: result.status};
+  return {stdout: result.stdout, stderr: result.stderr, exit_code: result.status};
 }
 
 function compareStdout(actual: string, expectedFile: string | null): boolean {
