@@ -239,12 +239,34 @@ function main(): void {
     }
   }
 
+  // Only execute tests that match the filter :3
+const test_cases_to_execute = args.include
+  ? discovered_test_cases.filter(
+      (test_case) =>
+        args.include!.includes(test_case.name) || args.include!.includes(test_case.category)
+    )
+  : discovered_test_cases;
+
+if (args.include) {
+  logger.debug(
+    "Include filter active: requested=%o selected=%d",
+    args.include,
+    test_cases_to_execute.length
+  );
+}
+
   const test_categories: Record<string, { total: number; passed: number; test_results: Record<string, TestCaseReport> }> = {};
+  let executed_count = 0;
+  let passed_count = 0;
 
 
-  for (const test_case of discovered_test_cases) {
+  for (const test_case of test_cases_to_execute) {
     const report = runTest(test_case);
     logger.info("Test case %s resulted in: %o", test_case.name, report);
+    executed_count += 1;
+    if (report.result === TestResult.PASSED) {
+      passed_count += 1;
+    }
 
     const category = test_case.category;
 
@@ -267,6 +289,13 @@ function main(): void {
 
   // // todo unexecuted
   const report = new TestReport({ discovered_test_cases, unexecuted: {}, results });
+  logger.debug(
+    "Execution summary: discovered=%d executed=%d passed=%d failed=%d",
+    discovered_test_cases.length,
+    executed_count,
+    passed_count,
+    executed_count - passed_count
+  );
   writeResult(report, args.output);
 
   logger.debug("End of program");
